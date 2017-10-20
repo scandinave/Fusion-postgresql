@@ -5,12 +5,14 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Iterator;
+import java.util.List;
 import java.util.TreeSet;
 
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Named;
+import javax.inject.Inject;
 
 import info.scandi.fusion.conf.ExclusionSchemas;
+import info.scandi.fusion.database.Cleaner;
+import info.scandi.fusion.database.Saver;
 import info.scandi.fusion.database.bdd.SequenceBDD;
 import info.scandi.fusion.database.bdd.TableBDD;
 import info.scandi.fusion.database.worker.AbstractWorker;
@@ -22,9 +24,13 @@ import info.scandi.fusion.exception.RequestException;
  * 
  * @author Scandinave
  */
-@Named
-@ApplicationScoped
 public abstract class AbstractPostgresqlWorker extends AbstractWorker {
+
+	@Inject
+	private Saver saver;
+
+	@Inject
+	private Cleaner cleaner;
 
 	/**
 	 * Default constructor.
@@ -42,6 +48,21 @@ public abstract class AbstractPostgresqlWorker extends AbstractWorker {
 	}
 
 	@Override
+	public void clean(List<String> exclusionSchemas, List<String> exclusionTables) throws FusionException {
+		cleaner.start(getTablesTypeTableWithExclusions(exclusionSchemas, exclusionTables));
+
+	}
+
+	@Override
+	public void save() throws FusionException {
+		if (this.conf.getDatabase().getBackup().isEnabled()) {
+			LOGGER.info("Saving database...");
+			saver.start(getAllTablesTypeTable());
+		}
+
+	}
+
+	@Override
 	public void restore() throws FusionException {
 		super.restore();
 		if (conf.getDatabase().getBackup().isEnabled()) {
@@ -51,7 +72,6 @@ public abstract class AbstractPostgresqlWorker extends AbstractWorker {
 
 	/*
 	 * (non-Javadoc)
-	 * 
 	 * @see dbunit.worker.IBDDWorker#toogleContrainte(boolean)
 	 */
 	@Override
@@ -99,6 +119,56 @@ public abstract class AbstractPostgresqlWorker extends AbstractWorker {
 	}
 
 	/**
+	 * Return a SequenceBDD to handle bas on exclusionShcemas and
+	 * exclusionTables.
+	 * 
+	 * @param resultSet
+	 *            The resultSet containing a sequence to parse.
+	 * @param exclusionSchemas
+	 *            The list of schema to exclude for the processing
+	 * @param exclusionTables
+	 *            The list of table to exclude for processing
+	 * @return The Sequence to handle if found.
+	 * @throws SQLException
+	 * @throws FusionException
+	 *             TODO Optimise this method. Reduce complexity and take care to
+	 *             break loop as needed
+	 */
+	private SequenceBDD parseSequences(ResultSet resultSet, ExclusionSchemas exclusionSchemas, String[] exclusionTables)
+			throws SQLException, FusionException {
+		String schemaName = resultSet.getString("schemaname");
+		String tableName = resultSet.getString("tableName");
+		String sequenceName = resultSet.getString("sequencename");
+		String primaryKey = resultSet.getString("primaryKey");
+		SequenceBDD result = null;
+		if (exclusionSchemas != null) {
+			for (String exclusionSchema : exclusionSchemas.getExclusionSchema()) {
+				if (!schemaName.equals(exclusionSchema)) {
+					if (exclusionTables != null) {
+						for (int j = 0; j < exclusionTables.length; j++) {
+							String exludeTable = exclusionTables[j];
+							if (!tableName.equals(exludeTable)) {
+								TableBDD tableBDD = new TableBDD(schemaName, tableName);
+								tableBDD.setPrimaryKey(primaryKey);
+								result = new SequenceBDD(tableBDD, sequenceName);
+							}
+						}
+					} else {
+						TableBDD tableBDD = new TableBDD(schemaName, tableName);
+						tableBDD.setPrimaryKey(primaryKey);
+						result = new SequenceBDD(tableBDD, sequenceName);
+					}
+				}
+			}
+		} else {
+			TableBDD tableBDD = new TableBDD(schemaName, tableName);
+			tableBDD.setPrimaryKey(primaryKey);
+			result = new SequenceBDD(tableBDD, sequenceName);
+		}
+		return result;
+	}
+
+	/**
 	 * Returns list of sequences in the database.
 	 * 
 	 * @return
@@ -107,12 +177,7 @@ public abstract class AbstractPostgresqlWorker extends AbstractWorker {
 	// TODO rewrite the loop
 	private TreeSet<SequenceBDD> getSequences(ExclusionSchemas exclusionSchemas, String[] exclusionTables)
 			throws FusionException {
-		String schemaName;
-		String sequenceName;
-		String primaryKey;
-		SequenceBDD sequence;
 		TreeSet<SequenceBDD> sequences = new TreeSet<SequenceBDD>();
-		String tableName;
 		try {
 			String sql = "SELECT n.nspname AS schemaname, c.relname as sequencename, t.relname as tablename, a.attname as primaryKey "
 					+ "FROM pg_class c " + "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -124,38 +189,7 @@ public abstract class AbstractPostgresqlWorker extends AbstractWorker {
 			ResultSet resultSet = statement.executeQuery();
 			if (resultSet != null) {
 				while (resultSet.next()) {
-					schemaName = resultSet.getString("schemaname");
-					tableName = resultSet.getString("tableName");
-					sequenceName = resultSet.getString("sequencename");
-					primaryKey = resultSet.getString("primaryKey");
-					if (exclusionSchemas != null) {
-						for (String exclusionSchema : exclusionSchemas.getExclusionSchema()) {
-							if (!schemaName.equals(exclusionSchema)) {
-								if (exclusionTables != null) {
-									for (int j = 0; j < exclusionTables.length; j++) {
-										String exludeTable = exclusionTables[j];
-										if (!tableName.equals(exludeTable)) {
-											TableBDD tableBDD = new TableBDD(schemaName, tableName);
-											tableBDD.setPrimaryKey(primaryKey);
-											sequence = new SequenceBDD(tableBDD, sequenceName);
-											sequences.add(sequence);
-										}
-									}
-								} else {
-									TableBDD tableBDD = new TableBDD(schemaName, tableName);
-									tableBDD.setPrimaryKey(primaryKey);
-									sequence = new SequenceBDD(tableBDD, sequenceName);
-									sequences.add(sequence);
-								}
-							}
-						}
-						;
-					} else {
-						TableBDD tableBDD = new TableBDD(schemaName, tableName);
-						tableBDD.setPrimaryKey(primaryKey);
-						sequence = new SequenceBDD(tableBDD, sequenceName);
-						sequences.add(sequence);
-					}
+					sequences.add(parseSequences(resultSet, exclusionSchemas, exclusionTables));
 				}
 			} else {
 				LOGGER.fine("no sequences to reset");
